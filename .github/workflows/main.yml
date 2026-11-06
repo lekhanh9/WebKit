@@ -1,0 +1,93 @@
+name: Build JSC 7615 (Linux x86_64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'WebKit ref (branch/tag/SHA)'
+        default: 'safari-7615.3.12.110-branch'
+        required: true
+      build_type:
+        description: 'Build type'
+        default: 'Release'
+        type: choice
+        options: [Release, Debug]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 22.04 ổn định hơn 24.04 cho WebKit cũ
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout WebKit
+        uses: actions/checkout@v4
+        with:
+          repository: WebKit/WebKit
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          submodules: false
+          path: webkit
+
+      - name: Show commit
+        working-directory: webkit
+        run: git log -1 --oneline
+
+      - name: Install dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build build-essential \
+            libicu-dev ruby python3 python3-dev \
+            bison flex gperf libtool autoconf automake \
+            pkg-config libxml2-dev libxslt1-dev \
+            libsqlite3-dev zlib1g-dev libsoup-3.0-dev \
+            libsecret-1-dev libgcrypt20-dev
+        # Lưu ý: một số gói (libsoup, libsecret) chỉ cần nếu build GTK port.
+        # JSCOnly thuần có thể bỏ qua, nhưng cài sẵn cho chắc.
+
+      - name: Build jsc (JSCOnly port)
+        working-directory: webkit
+        run: |
+          # Cách chính thức của WebKit: build-webkit tự lo mọi thứ
+          Tools/Scripts/build-webkit --jsc-only --release \
+            --cmakeargs="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_STATIC_JSC=ON" \
+            --makeargs="-j$(nproc)"
+        # Nếu --release/Debug: đổi --release thành --debug
+
+      - name: Locate jsc binary
+        working-directory: webkit
+        run: |
+          echo "== tìm jsc =="
+          find WebKitBuild -name jsc -type f 2>/dev/null
+          echo "== fallback layout =="
+          ls -la WebKitBuild/JSCOnly/Release/bin/ 2>/dev/null || \
+          ls -la WebKitBuild/Release/bin/ 2>/dev/null || true
+
+      - name: Sanity check
+        working-directory: webkit
+        run: |
+          JSC=$(find WebKitBuild -name jsc -type f | head -1)
+          echo "JSC=$JSC"
+          file "$JSC"
+          "$JSC" -e 'print("1+1=" + (1+1))'
+          "$JSC" -e 'print("Float64Array(4).length=" + new Float64Array(4).length)'
+          "$JSC" --help 2>&1 | head -20 || true
+
+      - name: Package artifact
+        working-directory: webkit
+        run: |
+          mkdir -p ../out
+          JSC=$(find WebKitBuild -name jsc -type f | head -1)
+          cp "$JSC" ../out/jsc
+          chmod +x ../out/jsc
+          # lưu options mặc định để biết bản này bật cờ gì
+          "$JSC" --options 2>/dev/null | head -80 > ../out/options.txt || true
+          file ../out/jsc
+          ldd ../out/jsc | head -20
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsc-7615-linux-${{ inputs.build_type }}-${{ github.run_number }}
+          path: out/
+          retention-days: 30
