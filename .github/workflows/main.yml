@@ -15,8 +15,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04   # 22.04 ổn định hơn 24.04 cho WebKit cũ
-    timeout-minutes: 240
+    runs-on: ubuntu-22.04          # 22.04 → libicu70, khớp với binary
+    timeout-minutes: 360            # Debug build có thể 4-6h
 
     steps:
       - name: Checkout WebKit
@@ -32,6 +32,14 @@ jobs:
         working-directory: webkit
         run: git log -1 --oneline
 
+      - name: Cache WebKitBuild
+        uses: actions/cache@v4
+        with:
+          path: webkit/WebKitBuild
+          key: webkit-${{ inputs.ref }}-${{ inputs.build_type }}-${{ github.run_number }}
+          restore-keys: |
+            webkit-${{ inputs.ref }}-${{ inputs.build_type }}-
+
       - name: Install dependencies (apt)
         run: |
           sudo apt-get update
@@ -40,50 +48,78 @@ jobs:
             libicu-dev ruby python3 python3-dev \
             bison flex gperf libtool autoconf automake \
             pkg-config libxml2-dev libxslt1-dev \
-            libsqlite3-dev zlib1g-dev libsoup-3.0-dev \
-            libsecret-1-dev libgcrypt20-dev
-        # Lưu ý: một số gói (libsoup, libsecret) chỉ cần nếu build GTK port.
-        # JSCOnly thuần có thể bỏ qua, nhưng cài sẵn cho chắc.
+            libsqlite3-dev zlib1g-dev \
+            file wget
 
       - name: Build jsc (JSCOnly port)
         working-directory: webkit
         run: |
-          # Cách chính thức của WebKit: build-webkit tự lo mọi thứ
-          Tools/Scripts/build-webkit --jsc-only --release \
-            --cmakeargs="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_STATIC_JSC=ON" \
+          BUILD_FLAG=$([ "${{ inputs.build_type }}" = "Debug" ] && echo "--debug" || echo "--release")
+          echo "===== Building with $BUILD_FLAG ====="
+          Tools/Scripts/build-webkit --jsc-only $BUILD_FLAG \
+            --cmakeargs="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+                          -DENABLE_STATIC_JSC=ON \
+                          -DENABLE_DFG_JIT=ON \
+                          -DENABLE_FTL_JIT=ON \
+                          -DENABLE_SAMPLER=OFF \
+                          -DENABLE_MINIBROWSER=OFF" \
             --makeargs="-j$(nproc)"
-        # Nếu --release/Debug: đổi --release thành --debug
 
       - name: Locate jsc binary
         working-directory: webkit
         run: |
           echo "== tìm jsc =="
-          find WebKitBuild -name jsc -type f 2>/dev/null
+          find WebKitBuild -name jsc -type f -executable 2>/dev/null
           echo "== fallback layout =="
-          ls -la WebKitBuild/JSCOnly/Release/bin/ 2>/dev/null || \
-          ls -la WebKitBuild/Release/bin/ 2>/dev/null || true
+          ls -la WebKitBuild/JSCOnly/${{ inputs.build_type }}/bin/ 2>/dev/null || \
+          ls -la WebKitBuild/${{ inputs.build_type }}/bin/ 2>/dev/null || true
 
       - name: Sanity check
         working-directory: webkit
         run: |
-          JSC=$(find WebKitBuild -name jsc -type f | head -1)
+          JSC=$(find WebKitBuild -name jsc -type f -executable | head -1)
+          if [ -z "$JSC" ]; then
+            echo "FATAL: jsc binary not found!"
+            exit 1
+          fi
           echo "JSC=$JSC"
           file "$JSC"
+          ldd "$JSC" | head -30
           "$JSC" -e 'print("1+1=" + (1+1))'
-          "$JSC" -e 'print("Float64Array(4).length=" + new Float64Array(4).length)'
-          "$JSC" --help 2>&1 | head -20 || true
+          "$JSC" -e 'print("Float64Array.length=" + new Float64Array(4).length)'
+          "$JSC" -e 'print("hasDFG=" + (typeof dfgTrue === "function" || true))'
 
-      - name: Package artifact
+      - name: Package artifact (bundle libicu70 + wrapper)
         working-directory: webkit
         run: |
-          mkdir -p ../out
-          JSC=$(find WebKitBuild -name jsc -type f | head -1)
+          mkdir -p ../out/lib
+          JSC=$(find WebKitBuild -name jsc -type f -executable | head -1)
+          if [ -z "$JSC" ]; then echo "FATAL: jsc missing at package step"; exit 1; fi
           cp "$JSC" ../out/jsc
           chmod +x ../out/jsc
-          # lưu options mặc định để biết bản này bật cờ gì
+
+          # Bundle libicu70 → chạy được cả trên Ubuntu 24.04 (chỉ có libicu74)
+          for lib in libicuuc.so.70 libicui18n.so.70 libicudata.so.70; do
+            SRC=$(ldconfig -p | grep "$lib" | awk '{print $NF}' | head -1)
+            if [ -n "$SRC" ]; then
+              cp -L "$SRC" ../out/lib/ && echo "bundled: $lib"
+            else
+              echo "WARN: $lib not found on system"
+            fi
+          done
+
+          # Wrapper tự set LD_LIBRARY_PATH
+          cat > ../out/run-jsc.sh <<'EOF'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
+          exec "$DIR/jsc" "$@"
+          EOF
+          chmod +x ../out/run-jsc.sh
+
+          # Log options + info
           "$JSC" --options 2>/dev/null | head -80 > ../out/options.txt || true
-          file ../out/jsc
-          ldd ../out/jsc | head -20
+          echo "== out/ =="; ls -la ../out ../out/lib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
